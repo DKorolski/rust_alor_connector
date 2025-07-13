@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "alor_http",
+    "alor_connector"   # существующий крейт с WS
+]
+resolver = "2"

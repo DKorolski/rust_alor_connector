@@ -1,0 +1,11 @@
+# macOS
+.DS_Store
+
+# Cargo
+**/target/
+**/Cargo.lock
+
+# IDE & редакторы
+*.swp
+.idea/
+.vscode/
