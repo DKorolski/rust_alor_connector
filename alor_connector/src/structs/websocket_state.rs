@@ -20,6 +20,7 @@ pub struct WebSocketState {
 	pub write_stream: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
 	read_stream:  SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
     alive_subs: HashMap<Uuid, String>,   // guid -> raw JSON
+	last_bar_ts:  HashMap<(String, String), i64>,   // ← НОВОЕ
     http: Arc<AlorHttp>,
 }
 use crate::structs::history_data::HistoryDataResponse;
@@ -154,6 +155,7 @@ impl WebSocketState {
             write_stream: write,
             read_stream:  read,
             alive_subs:   HashMap::new(),
+			last_bar_ts:  HashMap::new(),  // ← инициализируем
             http,
         };
 
@@ -172,15 +174,40 @@ impl WebSocketState {
 
 
 	pub async fn poll_next(&mut self, callback: fn(&Value)) -> anyhow::Result<()> {
-        if let Some(msg) = self.read_stream.next().await {
-            if let Ok(Message::Text(txt)) = msg {
-                if let Ok(v) = serde_json::from_str::<Value>(&txt) {
-                    callback(&v);
-                }
-            }
-        }
-        Ok(())
-    }
+		use futures_util::StreamExt;
+
+		if let Some(msg) = self.read_stream.next().await {
+			if let Ok(Message::Text(txt)) = msg {
+				if let Ok(v) = serde_json::from_str::<Value>(&txt) {
+					// --- фильтр дубликатов баров ---------------------------------
+					if v.get("opcode")
+						.and_then(|o| o.as_str())
+						== Some("BarsGetAndSubscribe")
+					{
+						if let (Some(sym), Some(tf), Some(ts)) = (
+							v.get("code").and_then(|s| s.as_str()),
+							v.get("tf").and_then(|t| t.as_str()),
+							v.get("data").and_then(|d| d.get("time")).and_then(|t| t.as_i64()),
+						) {
+							let key = (sym.to_owned(), tf.to_owned());
+							if let Some(prev) = self.last_bar_ts.get(&key) {
+								if *prev == ts {
+									// дубликат — ничего не делаем
+									return Ok(());
+								}
+							}
+							self.last_bar_ts.insert(key, ts);
+						}
+					}
+					// ----------------------------------------------------------------
+
+					callback(&v);   // вызываем пользователский обработчик
+				}
+			}
+		}
+		Ok(())
+	}
+
 
 	pub async fn new(url: Uri, callback: fn(&Value)) -> Self {
 		// создаём временный AlorHttp только для JWT-чанка (истечёт – reconnect сработает)
@@ -222,6 +249,37 @@ impl WebSocketState {
 			"opcode": "QuotesSubscribe",
 			"code": code,
 			"exchange": exchange,
+			"token": jwt,
+			"guid": Uuid::new_v4().to_string(),
+		});
+		let guid = req["guid"].as_str().unwrap().to_string();
+
+		self.write_stream
+			.send(Message::Text(req.to_string().into()))
+			.await?;
+
+		self.alive_subs.insert(Uuid::parse_str(&guid)?, req.to_string());
+		Ok(())
+	}
+
+	pub async fn subscribe_bars(
+		&mut self,
+		code: &str,
+		tf: &str,                  //  "60" | "D" | …
+		exchange: &str,
+	) -> anyhow::Result<()> {
+		let jwt = self.http.jwt().await;
+		let from = (Utc::now() - chrono::Duration::hours(150)).timestamp();
+
+		let req = json!({
+			"opcode": "BarsGetAndSubscribe",
+			"code": code,
+			"tf": tf,
+			"from": from,
+			"skipHistory": false,
+			"exchange": exchange,
+			"format": "Simple",     // можно "Heavy"/"Slim"
+			"frequency": 100,       // ≥25 для Simple
 			"token": jwt,
 			"guid": Uuid::new_v4().to_string(),
 		});

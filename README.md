@@ -12,3 +12,5 @@ commit 1
 – AlorHttp::get_history() + AlorHttp::get_history_chunk()
 – jwt_refresh_loop()
 – keep examples (fetch_history.rs, ws_subscribe.rs)
+
+- subscribe_quotes → subscribe_bars; example ws_bars.rs (BarsGetAndSubscribe)
