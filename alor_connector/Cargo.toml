@@ -21,6 +21,8 @@ anyhow      = "1.0"
 url         = "2"
 http = "1"
 dotenvy = "0.15"
+futures-core = "0.3"
+tokio-stream = "0.1"
 
 
 alor_http = { path = "../alor_http" }

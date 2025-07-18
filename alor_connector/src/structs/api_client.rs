@@ -1,79 +1,98 @@
+// alor_connector/src/structs/api_client.rs
+
 use base64::engine::general_purpose;
 use base64::Engine;
 use reqwest::Url;
 use serde_json::Value;
 use std::error::Error;
 use std::str::FromStr;
-use tokio_tungstenite::tungstenite::http::Uri;
-use crate::structs::websocket_state::WebSocketState;
 
-// #[derive(Clone)]
+// alias the `http::Uri` crate so that `http` can remain your variable name
+use http::Uri as HttpUri;
+use tokio_tungstenite::tungstenite::http::Uri;
+
+use tokio::sync::watch;
+
+use crate::structs::websocket_state::WebSocketState;
+use alor_http::AlorHttp;
+
+
+
 pub struct ApiClient {
     pub client: reqwest::Client,
     pub oauth_server: Url,
     pub api_server: Url,
-    // pub cws_server: Url,
-    pub socket_client: WebSocketState
+    pub socket_client: WebSocketState,
 }
 
 impl ApiClient {
-    pub async fn new(demo: bool, get_bar_callback: fn(&Value)) -> Result<Self, Box<dyn Error>> {
-        let oauth_server: Url;
-        let api_server: Url;
-        // let cws_server: Url;
-        let ws_server: Uri;
-        if demo {
-            oauth_server = Url::parse("https://oauthdev.alor.ru")?;
-            api_server = Url::parse("https://apidev.alor.ru")?;
-            // cws_server = Url::parse("wss://apidev.alor.ru/cws")?;
-            ws_server = Uri::from_str("wss://apidev.alor.ru/ws")?;
+    pub async fn new(demo: bool) -> Result<Self, Box<dyn Error>> {
+        // 1) Pick endpoints
+        let (oauth_server, api_server, ws_server): (Url, Url, HttpUri) = if demo {
+            (
+                Url::parse("https://oauthdev.alor.ru")?,
+                Url::parse("https://apidev.alor.ru")?,
+                "wss://apidev.alor.ru/ws".parse()?,
+            )
         } else {
-            oauth_server = Url::parse("https://oauth.alor.ru")?;
-            api_server = Url::parse("https://api.alor.ru")?;
-            // cws_server = Url::parse("wss://api.alor.ru/cws")?;
-            ws_server = Uri::from_str("wss://api.alor.ru/ws")?;
-        }
+            (
+                Url::parse("https://oauth.alor.ru")?,
+                Url::parse("https://api.alor.ru")?,
+                "wss://api.alor.ru/ws".parse()?,
+            )
+        };
+
+        // 2) Create your HTTP client
+        let client = reqwest::Client::builder()
+            .use_rustls_tls()
+            .build()?;
+
+        // 3) Create the AlorHttp (with JWT refresh)
+        let refresh_token = std::env::var("REFRESH_TOKEN")
+            .expect("REFRESH_TOKEN not set");
+        let alor_http = std::sync::Arc::new(
+            AlorHttp::new(refresh_token, demo).await?
+        );
+
+        // 4) Create a shutdown channel for graceful WS teardown
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        // 5) Spin up your WS pipeline
+        let socket_client =
+            WebSocketState::new_pipeline(ws_server, alor_http, shutdown_rx)
+                .await?;
 
         Ok(ApiClient {
-            client: reqwest::Client::builder()
-                .use_rustls_tls()          // ← TLS через rustls
-                .build()
-                .unwrap(),
+            client,
             oauth_server,
             api_server,
-            socket_client: WebSocketState::new(ws_server, get_bar_callback).await,
+            socket_client,
         })
     }
-}
 
-impl ApiClient {
+    // … your existing validate_response and decode_token methods …
     pub async fn validate_response(
         &self,
         response: reqwest::Response,
     ) -> Result<Value, Box<dyn Error>> {
-        let response_json: Value = serde_json::from_str(&response.error_for_status()?.text().await?)?;
-
-        Ok(response_json)
+        let text = response.error_for_status()?.text().await?;
+        Ok(serde_json::from_str(&text)?)
     }
 
     pub fn decode_token(&self, token: String) -> Result<Value, Box<dyn Error>> {
-        let token_split = token.split(".");
-
-        let token_data = token_split.skip(1).next().unwrap();
-        let data_string = Self::decode_base64_with_padding(token_data)?;
-
-        Ok(serde_json::from_str(&data_string)?)
+        let parts: Vec<&str> = token.split('.').collect();
+        let payload = parts.get(1)
+            .ok_or("malformed JWT")?;
+        let decoded = Self::decode_base64_with_padding(payload)?;
+        Ok(serde_json::from_str(&decoded)?)
     }
 
-    fn decode_base64_with_padding(encoded: &str) -> Result<String, Box<dyn Error>> {
-        // Calculate the number of padding characters needed
-        let padding_needed = (4 - encoded.len() % 4) % 4;
-
-        // Create a new string with padding
-        let padded_encoded = format!("{}{}", encoded, "=".repeat(padding_needed));
-
-        Ok(String::from_utf8(
-            general_purpose::STANDARD.decode(&padded_encoded)?,
-        )?)
+    fn decode_base64_with_padding(
+        encoded: &str
+    ) -> Result<String, Box<dyn Error>> {
+        let pad = (4 - encoded.len() % 4) % 4;
+        let s = format!("{}{}", encoded, "=".repeat(pad));
+        let bytes = general_purpose::STANDARD.decode(&s)?;
+        Ok(String::from_utf8(bytes)?)
     }
 }

@@ -3,7 +3,7 @@ use log::{debug, error, info, warn};
 use serde_json::{Value};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc};
-use tokio::sync::watch::{channel, Receiver};
+use tokio::sync::watch::{Receiver};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream};
 use tokio_tungstenite::tungstenite::http::Uri;
 
@@ -15,15 +15,40 @@ use futures_util::{StreamExt, SinkExt}; // SplitSink/Stream нужны
 use chrono::Utc;
 use alor_http::AlorHttp;             // <-- HTTP-клиент с JWT
 
+use futures_core::Stream;
+//use crate::{WsEvent, Quote, Bar}; 
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::spawn;
+use futures_util::stream::{BoxStream, StreamExt as _};
+use tokio_tungstenite::tungstenite::Error as WsError;
+use crate::structs::history_data::HistoryDataResponse;
+use tokio::sync::RwLock;
+use crate::types::{SubscriptionInfo, OpCode, WsEvent, Quote, Bar};
+use tokio::sync::watch::Receiver as ShutdownReceiver;
+
+
 
 pub struct WebSocketState {
 	pub write_stream: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
-	read_stream:  SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
-    alive_subs: HashMap<Uuid, String>,   // guid -> raw JSON
-	last_bar_ts:  HashMap<(String, String), i64>,   // ← НОВОЕ
+	//read_stream: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+	read_stream: BoxStream<'static, Result<Message, WsError>>,
+	 // 1) «Сырая» очередь для (guid, JSON)
+    raw_tx: mpsc::Sender<(Uuid, Value)>,
+    raw_rx: mpsc::Receiver<(Uuid, Value)>,
+
+
+    //alive_subs: HashMap<Uuid, String>,   // guid -> raw JSON
+	last_bar_ts:  HashMap<(String, String), i64>,
     http: Arc<AlorHttp>,
+	alive_subs: Arc<RwLock<HashMap<Uuid, SubscriptionInfo>>>,
+
+    // 3) Готовые события
+    event_tx: mpsc::Sender<WsEvent>,
+    pub event_rx: mpsc::Receiver<WsEvent>,
+	shutdown_rx: ShutdownReceiver<bool>,
 }
-use crate::structs::history_data::HistoryDataResponse;
+
 
 type WsSink = 
     futures_util::stream::SplitSink<
@@ -46,125 +71,58 @@ type WsPair = (
 	);
 
 
+impl Stream for WebSocketState {
+    type Item = WsEvent;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        // poll_recv есть прямо у Receiver
+        Pin::new(&mut self.event_rx).poll_recv(cx)
+    }
+}
+
+
 impl WebSocketState {
-	async fn socket_listener(mut stream: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>, _api_response_tx: mpsc::Sender<Value>, mut shutdown_rx: Receiver<bool>, callback: fn (&Value)) {
-		debug!("Starting WebSocketListener");
-
-		let mut prev_bar: Option<Value> = None;
-		loop {
-			tokio::select! {
-				// Ожидаем сообщение от WebSocket ИЛИ сигнал завершения
-				msg_result = stream.next() => {
-					match msg_result {
-						Some(Ok(msg)) => {
-							match msg {
-								Message::Text(txt) => {
-									match serde_json::from_str::<Value>(&txt) {
-										Ok(api_response) => {
-											debug!("Получен JSON: {:?}", api_response);
-											if api_response.get("data").is_none() {
-												continue;
-											}
-
-											if prev_bar.is_none() {
-												prev_bar = Some(api_response);
-												continue;
-											} else {
-												let prev_bar_data = prev_bar.clone().unwrap();
-
-												let current_bar_secconds = api_response["data"]["time"].clone().as_u64().unwrap();
-												let prev_bar_secconds = prev_bar_data["data"]["time"].clone().as_u64().unwrap();
-
-												if current_bar_secconds == prev_bar_secconds {  // обновленная версия текущего бара
-													prev_bar = Some(api_response);
-												} else if current_bar_secconds > prev_bar_secconds {
-													debug!("websocket_handler: OnNewBar {:?}", prev_bar_data);
-													// raise callback on previous bar
-													callback(&prev_bar.unwrap());
-													// set current bar as previous bar
-													prev_bar = Some(api_response);
-												}
-											}
-											// if api_response_tx.send(api_response).await.is_err() {
-											// 	error!("Не удалось отправить полученное сообщение (канал закрыт).");
-											// 	break; // Выход, если внешний приемник закрыт
-											// }
-										}
-										Err(e) => {
-											warn!("Не JSON: {}. Данные: {}", e, txt);
-											 // Можно отправить "сырое" сообщение или ошибку, если нужно
-											 // let raw_response = ApiResponse { event: "raw_text".into(), data: Some(serde_json::Value::String(txt)), .. };
-											 // if api_response_tx.send(raw_response).await.is_err() { break; }
-										}
-									}
-								}
-								Message::Binary(bin) => { // Обработка бинарных данных
-									 debug!("Бинарные данные: {} байт", bin.len());
-									 // Если нужно передать бинарные данные наружу, измените тип канала api_response_tx
-								}
-								Message::Ping(_) => {
-									debug!("Получен Ping")
-								},
-								Message::Pong(_) => {
-									// debug!("Получен Pong");
-								},
-								Message::Close(frame) => {
-									debug!("Соединение закрыто сервером: {:?}", frame);
-									break;
-								}
-								 Message::Frame(_) => warn!("Неожиданный Frame"),
-							}
-						},
-						Some(Err(e)) => {
-							error!("Ошибка чтения: {}", e);
-							// Попытка отправить ошибку наружу?
-							//  let err_response = Value { event: "read_error".into(), error_message: Some(e.to_string()), error_code: Some(-1), data:None, channel: None, symbol: None };
-							//  let _ = api_response_tx.send(err_response).await; // Игнорируем ошибку отправки здесь
-							break;
-						},
-						None => {
-							info!("Поток чтения завершен.");
-							 // Попытка отправить сообщение о дисконнекте?
-							 // let close_response = Value { event: "disconnected".into(), error_code: Some(-2), error_message: None, data:None, channel: None, symbol: None };
-							 // let _ = api_response_tx.send(close_response).await;
-							break;
-						}
-					}
-				}
-				// Проверяем сигнал завершения
-				_ = shutdown_rx.changed() => {
-					 if *shutdown_rx.borrow() {
-						info!("Получен сигнал завершения.");
-						panic!("socket closed");
-						break;
-					 }
-				}
-			}
-		}
-		info!("Задача чтения завершена.");
-		// api_response_tx закроется автоматически при выходе из функции
-	}
-
-	pub async fn with_http(
+	pub async fn new_pipeline(
         url: Uri,
         http: Arc<AlorHttp>,
-        callback: fn(&Value),
+		shutdown_rx: ShutdownReceiver<bool>,
     ) -> anyhow::Result<Self> {
-        let (write, read) = Self::connect(url.clone()).await?;
+        let (write, read) = Self::connect(url).await?;
+        let read_stream   = read.boxed();
+
+        // 1) Raw JSON channel
+        let (raw_tx, raw_rx) = mpsc::channel(256);
+
+        // 2) Subscriptions map
+        let alive_subs = Arc::new(RwLock::new(HashMap::new()));
+
+        // 3) Final events channel
+        let (event_tx, event_rx) = mpsc::channel(256);
+
         let mut me = Self {
             write_stream: write,
-            read_stream:  read,
-            alive_subs:   HashMap::new(),
-			last_bar_ts:  HashMap::new(),  // ← инициализируем
+            read_stream,
+
+            raw_tx,
+            raw_rx,
+
+            alive_subs,
+            last_bar_ts: HashMap::new(),
             http,
+
+            event_tx,
+            event_rx,
+			shutdown_rx,
         };
 
-        // первый запуск listener
-		//info!("запуск listener");
-        //me.spawn_listener(callback);
+        // spawn both stages
+        me.spawn_reader_loop();
+        me.spawn_dispatcher_loop();
         Ok(me)
     }
-
 
 
 	async fn connect(url: Uri) -> anyhow::Result<WsPair> {
@@ -173,123 +131,226 @@ impl WebSocketState {
 	}
 
 
-	pub async fn poll_next(&mut self, callback: fn(&Value)) -> anyhow::Result<()> {
-		use futures_util::StreamExt;
+	fn spawn_reader_loop(&mut self) {
+		let mut read = std::mem::replace(&mut self.read_stream, futures_util::stream::empty().boxed());
+		let raw_tx = self.raw_tx.clone();
+		let mut shutdown = self.shutdown_rx.clone();
 
-		if let Some(msg) = self.read_stream.next().await {
-			if let Ok(Message::Text(txt)) = msg {
-				if let Ok(v) = serde_json::from_str::<Value>(&txt) {
-					// --- фильтр дубликатов баров ---------------------------------
-					if v.get("opcode")
-						.and_then(|o| o.as_str())
-						== Some("BarsGetAndSubscribe")
-					{
-						if let (Some(sym), Some(tf), Some(ts)) = (
-							v.get("code").and_then(|s| s.as_str()),
-							v.get("tf").and_then(|t| t.as_str()),
-							v.get("data").and_then(|d| d.get("time")).and_then(|t| t.as_i64()),
-						) {
-							let key = (sym.to_owned(), tf.to_owned());
-							if let Some(prev) = self.last_bar_ts.get(&key) {
-								if *prev == ts {
-									// дубликат — ничего не делаем
-									return Ok(());
-								}
-							}
-							self.last_bar_ts.insert(key, ts);
+		tokio::spawn(async move {
+			loop {
+				tokio::select! {
+					biased;
+					_ = shutdown.changed() => {
+						if *shutdown.borrow() {
+							info!("reader_loop: shutdown signal received");
+							break;
 						}
 					}
-					// ----------------------------------------------------------------
-
-					callback(&v);   // вызываем пользователский обработчик
+					msg_opt = read.next() => match msg_opt {
+						Some(Ok(Message::Text(txt))) => {
+							// Скипаем ACK без data
+							if let Ok(v) = serde_json::from_str::<Value>(&txt) {
+								if v.get("data").is_none() {
+									continue;
+								}
+								if let Some(guid_s) = v.get("guid").and_then(Value::as_str) {
+									if let Ok(guid) = Uuid::parse_str(guid_s) {
+										let _ = raw_tx.send((guid, v)).await;
+									}
+								}
+							}
+						}
+						Some(Ok(Message::Ping(p))) => {
+							debug!("reader_loop: Ping {:?}", p);
+						}
+						Some(Ok(Message::Pong(p))) => {
+							debug!("reader_loop: Pong {:?}", p);
+						}
+						Some(Ok(Message::Close(frame))) => {
+							info!("reader_loop: connection closed by server: {:?}", frame);
+							break;
+						}
+						Some(Ok(_)) => { /* Binary, Frame — игнор */ }
+						Some(Err(e)) => {
+							error!("reader_loop: ws error: {}", e);
+							break;
+						}
+						None => {
+							info!("reader_loop: stream ended");
+							break;
+						}
+					}
 				}
 			}
-		}
-		Ok(())
+			info!("reader_loop: finished");
+		});
 	}
 
 
-	pub async fn new(url: Uri, callback: fn(&Value)) -> Self {
-		// создаём временный AlorHttp только для JWT-чанка (истечёт – reconnect сработает)
-		let dummy = Arc::new(
-			AlorHttp::new(std::env::var("REFRESH_TOKEN").unwrap(), false)
-				.await
-				.expect("create http"),
-		);
 
-		// подключаем WebSocket с использованием существующего клиента
-		info!("Подключение к Alor WebSocket...");
-		let ws_state = Self::with_http(url, dummy, callback)
-			.await
-			.expect("Не удалось подключиться");
 
-		info!("Успешно подключено!");
-		ws_state
+	fn spawn_dispatcher_loop(&mut self) {
+		// вынимаем raw_rx
+		let mut raw_rx = std::mem::replace(&mut self.raw_rx, mpsc::channel(1).1);
+		let subs_map = Arc::clone(&self.alive_subs);
+		let event_tx = self.event_tx.clone();
+
+		// для каждого guid храним последний ts и последний Value
+		let mut last_ts: HashMap<Uuid, i64> = HashMap::new();
+		let mut prev_bar_value: HashMap<Uuid, Value> = HashMap::new();
+		let mut last_quote: HashMap<Uuid, Quote> = HashMap::new(); // Добавим для хранения последней котировки
+
+		tokio::spawn(async move {
+			while let Some((guid, v)) = raw_rx.recv().await {
+				// пытаемся достать SubscriptionInfo
+				if let Some(info) = subs_map.read().await.get(&guid).cloned() {
+					// пробуем смэпить Value → WsEvent
+					if let Some(ev) = WsEvent::try_from_json(guid, &v, &info) {
+						// если это Bar — то обработаем бар
+						if let WsEvent::Bar(bar) = &ev {
+							let ts = bar.ts;
+							let prev_ts = last_ts.get(&guid).copied().unwrap_or(0);
+
+							if ts > prev_ts {
+								// новый бар — отправляем его дальше
+								event_tx.send(ev.clone()).await.unwrap();
+								last_ts.insert(guid, bar.ts);
+								prev_bar_value.insert(guid, v.clone());
+								debug!("Dispatching Bar: {:?}", ev);
+							} else {
+								debug!("Skipping duplicate/partial bar ts={} for guid={}", ts, guid);
+							}
+						}
+						// если это Quote — фильтруем повторяющиеся котировки
+						else if let WsEvent::Quote(q) = &ev {
+							if let Some(last_q) = last_quote.get(&guid) {
+								// Сравниваем цену, если она изменилась, выводим
+								if last_q.last_price != q.last_price || last_q.bid != q.bid || last_q.ask != q.ask {
+									// Новая котировка, выводим и обновляем last_quote
+									debug!("Dispatching Quote: {:?}", ev);
+									event_tx.send(ev.clone()).await.unwrap();
+									last_quote.insert(guid, q.clone());
+								} else {
+									debug!("Skipping duplicate quote for guid={}", guid);
+								}
+							} else {
+								// Если предыдущей котировки нет — выводим первую
+								debug!("Dispatching initial Quote: {:?}", ev);
+								event_tx.send(ev.clone()).await.unwrap();
+								last_quote.insert(guid, q.clone());
+							}
+						}
+						// Если это не Bar и не Quote, просто передаем
+						else {
+							let _ = event_tx.send(ev).await;
+						}
+					}
+				}
+			}
+			info!("dispatcher_loop: finished");
+		});
 	}
 
-	async fn reauthorize(&mut self) -> anyhow::Result<()> {
-		info!("reauthorizing");
+
+/// Пересылаем текущие подписки с новым token
+    async fn reauthorize(&mut self) -> anyhow::Result<()> {
+        info!("reauthorizing");
         let jwt = self.http.jwt().await;
-        // nothing else to send for /ws — достаточно подставить token в каждую подписку
-        for json in self.alive_subs.values() {
-            let mut v: Value = serde_json::from_str(json)?;
-            v["token"] = jwt.clone().into();
-            self.write_stream.send(Message::Text(v.to_string().into())).await?;
+        // Берем read-lock на мапу подписок
+        let subs_map = self.alive_subs.read().await;
+
+        for (guid, info) in subs_map.iter() {
+            // Собираем JSON заново по типу подписки
+            let req = match info.kind {
+                OpCode::QuotesSubscribe => json!({
+                    "opcode":   "QuotesSubscribe",
+                    "code":     info.symbol,
+                    "exchange": info.exchange,
+                    "token":    jwt,
+                    "guid":     guid.to_string(),
+                }),
+                OpCode::BarsGetAndSubscribe => {
+                    // У unwrap безопасен, т.к. для Bar tf всегда Some
+                    let tf = info.tf.as_ref().unwrap();
+                    json!({
+                        "opcode":      "BarsGetAndSubscribe",
+                        "code":        info.symbol,
+                        "tf":          tf,
+                        "exchange":    info.exchange,
+                        "token":       jwt,
+                        "guid":        guid.to_string(),
+                    })
+                }
+            };
+
+            // Отправляем текстовый фрейм; .into() превращает String → Utf8Bytes
+            self.write_stream
+                .send(Message::Text(req.to_string().into()))
+                .await?;
         }
+
         Ok(())
     }
 
-    pub async fn subscribe_quotes(
-		&mut self,
-		code: &str,
-		exchange: &str,
-	) -> anyhow::Result<()> {
-		let jwt = self.http.jwt().await;
-		let req = json!({
-			"opcode": "QuotesSubscribe",
-			"code": code,
+    pub async fn subscribe_quotes(&mut self, code: &str, exchange: &str) -> anyhow::Result<()> {
+		let guid = Uuid::new_v4();
+		let jwt  = self.http.jwt().await;
+		let req  = json!({
+			"opcode":   "QuotesSubscribe",
+			"code":     code,
 			"exchange": exchange,
-			"token": jwt,
-			"guid": Uuid::new_v4().to_string(),
+			"token":    jwt,
+			"guid":     guid.to_string(),
 		});
-		let guid = req["guid"].as_str().unwrap().to_string();
+		self.write_stream.send(Message::Text(req.to_string().into())).await?;
 
-		self.write_stream
-			.send(Message::Text(req.to_string().into()))
-			.await?;
-
-		self.alive_subs.insert(Uuid::parse_str(&guid)?, req.to_string());
+		let info = SubscriptionInfo {
+			symbol:   code.to_string(),
+			exchange: exchange.to_string(),
+			kind:     OpCode::QuotesSubscribe,
+			tf:       None,
+		};
+		self.alive_subs.write().await.insert(guid, info);
 		Ok(())
 	}
 
-	pub async fn subscribe_bars(
+    pub async fn subscribe_bars(
 		&mut self,
 		code: &str,
-		tf: &str,                  //  "60" | "D" | …
+		tf: &str,
 		exchange: &str,
+		from_timestamp: i64,      // начальное время в UNIX timestamp
 	) -> anyhow::Result<()> {
-		let jwt = self.http.jwt().await;
-		let from = (Utc::now() - chrono::Duration::hours(150)).timestamp();
+		let guid = Uuid::new_v4();
+		let jwt = self.http.jwt().await;  // Получаем токен для авторизации
+		let to_timestamp = Utc::now().timestamp();  // Текущее время для завершения диапазона
 
+		// Если нужны только новые бары, можно задать skipHistory = true, но при этом не обязательно указывать `from`
 		let req = json!({
 			"opcode": "BarsGetAndSubscribe",
-			"code": code,
-			"tf": tf,
-			"from": from,
-			"skipHistory": false,
-			"exchange": exchange,
-			"format": "Simple",     // можно "Heavy"/"Slim"
-			"frequency": 100,       // ≥25 для Simple
-			"token": jwt,
-			"guid": Uuid::new_v4().to_string(),
+			"code": code,                // Символ инструмента
+			"tf": tf,                    // Таймфрейм
+			"from": from_timestamp,      // Начало диапазона (в UNIX timestamp)
+			"to": to_timestamp,          // Конец диапазона (текущее время)
+			"skipHistory": false,        // Если false, запрашиваются бары с указанного времени, если true — только новые
+			"exchange": exchange,        // Биржа (например, "MOEX")
+			"format": "Simple",          // Формат данных
+			"frequency": 100,            // Частота обновления (можно настроить)
+			"token": jwt,                // Авторизационный токен
+			"guid": guid.to_string(),    // Уникальный идентификатор для подписки
 		});
-		let guid = req["guid"].as_str().unwrap().to_string();
 
-		self.write_stream
-			.send(Message::Text(req.to_string().into()))
-			.await?;
+		// Отправляем запрос на сервер
+		self.write_stream.send(Message::Text(req.to_string().into())).await?;
 
-		self.alive_subs.insert(Uuid::parse_str(&guid)?, req.to_string());
+		// Сохраняем информацию о подписке
+		self.alive_subs.write().await.insert(guid, SubscriptionInfo {
+			symbol: code.to_string(),
+			exchange: exchange.to_string(),
+			kind: OpCode::BarsGetAndSubscribe,
+			tf: Some(tf.to_string()),
+		});
+
 		Ok(())
 	}
 }

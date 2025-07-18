@@ -10,7 +10,11 @@ use chrono_tz::Tz;
 use futures_util::{SinkExt};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Utf8Bytes;
-pub use alor_http::{AlorHttp, Bar, AlorError};
+
+pub use alor_http::{AlorHttp, AlorError};          // Bar НЕ ре-экспортируем
+pub mod types;
+pub use types::{WsEvent, Quote, Bar, SubscriptionInfo};              // наш собственный Bar
+
 
 pub mod structs {
     pub mod api_client;
@@ -48,7 +52,8 @@ impl AlorRust {
 
     pub async fn new(refresh_token: &str, demo: bool, get_bar_callback: fn (&Value)) -> Self {
         info!("Initializing AlorRust, demo status: {demo}");
-        let client = ApiClient::new(demo, get_bar_callback).await.unwrap();
+        let client = ApiClient::new(demo).await.unwrap();
+
 
         let mut api = AlorRust {
             token_data: TokenData {

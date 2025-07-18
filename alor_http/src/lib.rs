@@ -43,6 +43,7 @@ pub struct AlorHttp {
     client:        Client,
 }
 
+#[allow(dead_code)]
 const REFRESH_ENDPOINT: &str = "https://oauth.alor.ru/refresh";
 
 
