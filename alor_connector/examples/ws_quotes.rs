@@ -39,6 +39,6 @@ async fn main() -> Result<()> {
 
     // 4) Бесконечно читаем поток: poll_next() вызывает print_event
     loop {
-        ws.poll_next(print_event).await?;
+        ws.next_with_callback(print_event).await?;
     }
 }
